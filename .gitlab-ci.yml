@@ -1,0 +1,255 @@
+image: alpine:latest
+
+variables:
+  KUBERNETES_VERSION: 1.13.0
+  HELM_VERSION: 2.12.1
+
+  DOCKER_DRIVER: overlay2
+
+  # HTTP_PROXY=http://192.168.201.38:8118
+  # HTTPS_PROXY=http://192.168.201.38:8118
+  # NO_PROXY=localhost,127.0.0.1,192.168.200.199,192.168.200.61,172.96.243.146,192.168.201.38
+
+  REGISTRY_IMAGE: $CI_REGISTRY/devops/demo-spring
+  IMAGE_TAG: latest
+
+stages:
+- make
+- build
+- production
+
+
+make:
+  stage: make
+  image: maven:3.6-alpine
+  cache:
+    paths:
+    - .m2/repository
+  variables:
+    MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  script:
+  - mvn package
+  artifacts:
+    paths:
+    - target/*.jar
+  only:
+  - branches
+
+build:
+  stage: build
+  image: docker:stable-git
+  variables:
+    DOCKER_HOST: tcp://localhost:2375
+  services:
+  - docker:stable-dind
+  script:
+  - setupDocker
+  - build
+  only:
+  - branches
+
+production:
+  stage: production
+  image: harbor.resoe.in/devops/helm-kubectl:latest
+  script:
+  - . /home/kubernetes/sbin/env.sh
+  - checkDubeDomain
+  - env
+  - cat $KUBECONFIG
+  - mv /chart ./
+  - kubectl config view
+  - ensureNamespace
+  - . /home/kubernetes/sbin/unset.sh
+  - initializeTiller
+  - createSecret
+  - deploy
+  environment:
+    name: production
+    url: http://spring.$AUTO_DEVOPS_DOMAIN
+  only:
+    refs:
+    - master
+    kubernetes: active
+  except:
+    variables:
+    - $STAGING_ENABLED
+    - $CANARY_ENABLED
+    - $INCREMENTAL_ROLLOUT_ENABLED
+    - $INCREMENTAL_ROLLOUT_MODE
+
+# ---------------------------------------------------------------------------
+
+.auto_devops: &auto_devops |
+  # Auto DevOps variables and functions
+  set -x
+
+  function registryLogin() {
+    if [[ -n "$CI_REGISTRY_USER" ]]; then
+      echo "Logging to GitLab Container Registry with CI credentials..."
+      docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+      echo ""
+    fi
+  }
+
+  function getReplicas() {
+    track="${1:-stable}"
+    percentage="${2:-100}"
+
+    env_track=$( echo $track | tr -s  '[:lower:]'  '[:upper:]' )
+    env_slug=$( echo ${CI_ENVIRONMENT_SLUG//-/_} | tr -s  '[:lower:]'  '[:upper:]' )
+
+    if [[ "$track" == "stable" ]] || [[ "$track" == "rollout" ]]; then
+      # for stable track get number of replicas from `PRODUCTION_REPLICAS`
+      eval new_replicas=\$${env_slug}_REPLICAS
+      if [[ -z "$new_replicas" ]]; then
+        new_replicas=$REPLICAS
+      fi
+    else
+      # for all tracks get number of replicas from `CANARY_PRODUCTION_REPLICAS`
+      eval new_replicas=\$${env_track}_${env_slug}_REPLICAS
+      if [[ -z "$new_replicas" ]]; then
+        eval new_replicas=\${env_track}_REPLICAS
+      fi
+    fi
+
+    replicas="${new_replicas:-1}"
+    replicas="$(($replicas * $percentage / 100))"
+
+    # always return at least one replicas
+    if [[ $replicas -gt 0 ]]; then
+      echo "$replicas"
+    else
+      echo 1
+    fi
+  }
+
+  function deploy() {
+    track="${1-stable}"
+    percentage="${2:-100}"
+    name="$CI_ENVIRONMENT_SLUG"
+
+    replicas="1"
+    service_enabled="true"
+    postgres_enabled="$POSTGRES_ENABLED"
+
+    echo "start deploy"
+
+    # if track is different than stable,
+    # re-use all attached resources
+    if [[ "$track" != "stable" ]]; then
+      name="$name-$track"
+      service_enabled="false"
+      postgres_enabled="false"
+    fi
+
+    replicas=$(getReplicas "$track" "$percentage")
+
+    if [[ "$CI_PROJECT_VISIBILITY" != "public" ]]; then
+      secret_name='gitlab-registry'
+    else
+      secret_name=''
+    fi
+
+    echo "do helm install"
+
+    helm delete --purge "$name" || true
+
+    echo helm installing...
+
+    helm upgrade --install \
+      --wait \
+      --set service.enabled="$service_enabled" \
+      --set releaseOverride="$CI_ENVIRONMENT_SLUG" \
+      --set image.repository="$REGISTRY_IMAGE" \
+      --set image.tag="$IMAGE_TAG" \
+      --set image.pullPolicy=Always \
+      --set image.secrets[0].name="$secret_name" \
+      --set application.track="$track" \
+      --set service.url="$CI_ENVIRONMENT_URL" \
+      --set service.externalPort=80 \
+      --set service.internalPort=8080 \
+      --set replicaCount="$replicas" \
+      --set postgresql.enabled=false \
+      --namespace="$KUBE_NAMESPACE" \
+      "$name" \
+      chart/
+
+    kubectl rollout status -n "$KUBE_NAMESPACE" -w "deployment/$name"
+  }
+
+  function setupDocker() {
+    if ! docker info &>/dev/null; then
+      if [ -z "$DOCKER_HOST" -a "$KUBERNETES_PORT" ]; then
+        export DOCKER_HOST='tcp://localhost:2375'
+      fi
+    fi
+  }
+
+  function ensureNamespace() {
+    kubectl describe namespace "$KUBE_NAMESPACE" || kubectl create namespace "$KUBE_NAMESPACE"
+  }
+
+  function checkDubeDomain() {
+    if [ -z ${AUTO_DEVOPS_DOMAIN+x} ]; then
+      echo "In order to deploy or use Review Apps, AUTO_DEVOPS_DOMAIN variable must be set"
+      echo "You can do it in Auto DevOps project settings or defining a variable at group or project level"
+      echo "You can also manually add it in .gitlab-ci.yml"
+      false
+    else
+      true
+    fi
+  }
+
+  function build() {
+    registryLogin
+
+    echo "Building Dockerfile-based application..."
+    docker pull $REGISTRY_IMAGE:$IMAGE_TAG || true
+    docker build \
+      --build-arg HTTP_PROXY="$HTTP_PROXY" \
+      --build-arg http_proxy="$http_proxy" \
+      --build-arg HTTPS_PROXY="$HTTPS_PROXY" \
+      --build-arg https_proxy="$https_proxy" \
+      --build-arg FTP_PROXY="$FTP_PROXY" \
+      --build-arg ftp_proxy="$ftp_proxy" \
+      --build-arg NO_PROXY="$NO_PROXY" \
+      --build-arg no_proxy="$no_proxy" \
+      --cache-from=$REGISTRY_IMAGE:$IMAGE_TAG \
+      -t "$REGISTRY_IMAGE:$IMAGE_TAG" .
+
+    echo "Pushing to GitLab Container Registry..."
+    docker push "$REGISTRY_IMAGE:$IMAGE_TAG"
+    echo ""
+  }
+
+  function initializeTiller() {
+    echo "Checking Tiller..."
+
+    export HELM_HOST=":44134"
+    tiller -listen ${HELM_HOST} -alsologtostderr > /dev/null 2>&1 &
+    echo "Tiller is listening on ${HELM_HOST}"
+
+    if ! helm version --debug; then
+      echo "Failed to init Tiller."
+      return 1
+    fi
+    echo ""
+  }
+
+  function createSecret() {
+    echo "Create secret..."
+    if [[ "$CI_PROJECT_VISIBILITY" == "public" ]]; then
+      return
+    fi
+
+    kubectl create secret -n "$KUBE_NAMESPACE" \
+      docker-registry gitlab-registry \
+      --docker-server="$CI_REGISTRY" \
+      --docker-username="${CI_DEPLOY_USER:-$CI_REGISTRY_USER}" \
+      --docker-password="${CI_DEPLOY_PASSWORD:-$CI_REGISTRY_PASSWORD}" \
+      --docker-email="$GITLAB_USER_EMAIL" \
+      -o yaml --dry-run | kubectl replace -n "$KUBE_NAMESPACE" --force -f -
+  }
+
+before_script:
+- *auto_devops

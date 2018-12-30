@@ -12,7 +12,7 @@ public class DemoApplication {
     String home() {
         return "<pre style='font-size: 16px; font-family: none;'>" +
                 "Demo: Spring Boot is here! built on 20181229.\n" +
-                "        # support env unset\n" +
+                "        1. test page: <a src='test.html'>click me</a>\n" +
                 "</pre>";
     }
 

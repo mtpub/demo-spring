@@ -14,10 +14,22 @@ variables:
   IMAGE_TAG: latest
 
 stages:
+- template
 - make
 - build
 - production
 
+
+template:
+  stage: template
+  script:
+  - mkdir target
+  - cp -a src/template target/public
+  artifacts:
+    paths:
+    - target/*
+  only:
+  - branches
 
 make:
   stage: make
@@ -28,6 +40,7 @@ make:
   variables:
     MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
   script:
+  - mv target/public src/main/resources/
   - mvn package
   artifacts:
     paths:
